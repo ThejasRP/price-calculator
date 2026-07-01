@@ -56,24 +56,6 @@ def execute_d1_query(sql: str, params: list = None):
          
     return result["result"][0].get("results", [])
 
-def execute_d1_batch(queries: list):
-    """Executes a batch of queries (used for bulk uploading rows)"""
-    if not all([CF_ACCOUNT_ID, CF_DATABASE_ID, CF_API_TOKEN]):
-        print(f"Warning: Cloudflare credentials missing. Simulated saving {len(queries)} rows.")
-        return
-        
-    url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/d1/database/{CF_DATABASE_ID}/query"
-    headers = {
-        "Authorization": f"Bearer {CF_API_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    
-    # Cloudflare D1 accepts an array of query objects for batch operations
-    response = requests.post(url, headers=headers, json=queries)
-    if not response.ok:
-         raise Exception(f"D1 Batch Error: {response.text}")
-
-
 # ==========================================
 # HELPER: GEMINI AI SCHEMA MAPPER
 # ==========================================
@@ -161,15 +143,12 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
         mapping = get_ai_schema_mapping(sample_rows)
         
         # 3. Format Data
-        queries = []
         sync_timestamp = int(time.time() * 1000) # JS compatible timestamp
         
         # Delete old brand data in D1 before inserting new (to prevent duplicates on re-upload)
-        queries.append({
-            "sql": "DELETE FROM products WHERE brand_id = ?",
-            "params": [brandName]
-        })
+        execute_d1_query("DELETE FROM products WHERE brand_id = ?", [brandName])
         
+        valid_products = []
         for row in all_rows[1:]:
             if len(row) < 3: continue
                 
@@ -191,27 +170,31 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
             model_name = get_val("model_name_index")
             
             if ex_gst > 0 and inc_gst > 0 and model_name:
-                # Prepare D1 insertion payload
-                queries.append({
-                    "sql": """INSERT INTO products 
-                              (id, brand_id, model_name, mrp, list_price_ex_gst, list_price_inc_gst, attributes, updated_at) 
-                              VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    "params": [
-                        str(uuid.uuid4()), brandName, model_name, mrp, 
-                        ex_gst, inc_gst, json.dumps(attrs), sync_timestamp
-                    ]
-                })
+                # Append row data as a list of params
+                valid_products.append([
+                    str(uuid.uuid4()), brandName, model_name, mrp, 
+                    ex_gst, inc_gst, json.dumps(attrs), sync_timestamp
+                ])
                 
-        # 4. Push to Cloudflare D1
-        # (Cloudflare limits batch queries to ~100 statements per request, so we chunk them)
-        chunk_size = 100
-        for i in range(0, len(queries), chunk_size):
-            chunk = queries[i:i + chunk_size]
-            execute_d1_batch(chunk)
+        # 4. Push to Cloudflare D1 via Multi-Row Batch Inserts
+        # Cloudflare has a strict 100 bound parameters limit per query.
+        # We have 8 parameters per row, so max 12 rows per query (12 * 8 = 96)
+        chunk_size = 12
+        for i in range(0, len(valid_products), chunk_size):
+            chunk = valid_products[i:i + chunk_size]
+            
+            placeholders = ",".join(["(?, ?, ?, ?, ?, ?, ?, ?)"] * len(chunk))
+            # Flatten the nested list of parameters
+            params = [item for row in chunk for item in row]
+            
+            sql = f"""INSERT INTO products 
+                      (id, brand_id, model_name, mrp, list_price_ex_gst, list_price_inc_gst, attributes, updated_at) 
+                      VALUES {placeholders}"""
+            execute_d1_query(sql, params)
             
         return {
             "status": "success", 
-            "message": f"Successfully processed and synced {len(queries) - 1} products to D1."
+            "message": f"Successfully processed and synced {len(valid_products)} products to D1."
         }
         
     except Exception as e:
