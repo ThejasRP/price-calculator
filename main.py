@@ -66,18 +66,22 @@ def get_ai_schema_mapping(sample_rows):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
     
     system_prompt = """You are a data schema mapper for an electrical goods app. 
-    I will provide a JSON array containing the first 4 rows of an extracted PDF table (the header row and 3 context data rows).
-    Using the data context (e.g., figuring out which price is lowest for Ex-GST vs highest for MRP), identify which column index (0-based) corresponds to our database fields.
+    I will provide a JSON array containing the first 8 rows of an extracted PDF table.
+    First, identify which row actually contains the column headers (usually index 0, 1, or 2).
+    Then, identify which column index (0-based) corresponds to our core database fields.
+    
+    CRITICAL: For the "attribute_indices" array, you MUST include ALL remaining column indices that contain specs (e.g., Category, Colour, Sweep, Star Rating). Do not leave this array empty if there are extra columns!
     
     Return ONLY a valid JSON object matching this schema exactly:
     {
+      "header_row_index": integer,
       "model_name_index": integer, 
       "mrp_index": integer,
       "list_price_ex_gst_index": integer, 
       "list_price_inc_gst_index": integer,
-      "attribute_indices": [array of integers for remaining specs]
+      "attribute_indices": [integer, integer, ...]
     }
-    Use -1 if a field is completely missing."""
+    Use -1 if a core field is completely missing."""
     
     payload = {
         "contents": [{"parts": [{"text": f"Sample Context Rows:\n{json.dumps(sample_rows, indent=2)}"}]}],
@@ -137,10 +141,14 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
         if len(all_rows) < 2:
             raise HTTPException(status_code=400, detail="No readable tabular data found in PDF.")
             
-        # 2. Get AI Schema Mapping
-        headers = all_rows[0]
-        sample_rows = all_rows[:4]
+        # 2. Get AI Schema Mapping (Use first 8 rows to catch hidden headers)
+        sample_rows = all_rows[:8]
         mapping = get_ai_schema_mapping(sample_rows)
+        
+        header_idx = mapping.get("header_row_index", 0)
+        if header_idx >= len(all_rows): 
+            header_idx = 0
+        headers = all_rows[header_idx]
         
         # 3. Format Data
         sync_timestamp = int(time.time() * 1000) # JS compatible timestamp
@@ -149,16 +157,22 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
         execute_d1_query("DELETE FROM products WHERE brand_id = ?", [brandName])
         
         valid_products = []
-        for row in all_rows[1:]:
+        # Skip rows up to and including the AI-identified header row
+        for row in all_rows[header_idx + 1:]:
             if len(row) < 3: continue
                 
             attrs = {}
             if mapping.get("attribute_indices"):
                 for idx in mapping["attribute_indices"]:
-                    if idx != -1 and idx < len(row) and idx < len(headers):
-                        clean_header = ''.join(c for c in headers[idx] if c.isalnum() or c.isspace()).strip()
-                        if clean_header and row[idx]:
-                            attrs[clean_header] = row[idx]
+                    try:
+                        idx = int(idx)
+                        if idx != -1 and idx < len(row) and idx < len(headers):
+                            clean_header = ''.join(c for c in headers[idx] if c.isalnum() or c.isspace()).strip()
+                            # Prevent core fields from accidentally showing up as spec badges
+                            if clean_header and row[idx] and idx not in [mapping.get("mrp_index"), mapping.get("list_price_ex_gst_index"), mapping.get("list_price_inc_gst_index"), mapping.get("model_name_index")]:
+                                attrs[clean_header] = row[idx]
+                    except (ValueError, TypeError):
+                        continue
                             
             def get_val(key):
                 idx = mapping.get(key, -1)
