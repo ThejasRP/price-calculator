@@ -10,7 +10,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 
-app = FastAPI(title="RateEngine API (PDF -> Gemini -> Cloudflare D1)")
+app = FastAPI(title="RateEngine")
 
 app.add_middleware(
     CORSMiddleware,
@@ -66,12 +66,12 @@ def get_ai_schema_mapping(sample_rows):
     
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
     
-    system_prompt = """You are a data schema mapper for an electrical goods app. 
-    I will provide a JSON array containing the first 8 rows of an extracted PDF table.
+    system_prompt = """You are a highly adaptable data schema mapper for a general product catalog and pricing application. 
+    I will provide a JSON array containing the first 8 rows of an extracted PDF table representing a price list for ANY type of product (e.g., electricals, appliances, hardware, plumbing, etc.).
     First, identify which row actually contains the column headers (usually index 0, 1, or 2).
     Then, identify which column index (0-based) corresponds to our core database fields.
     
-    CRITICAL: For the "attribute_indices" array, you MUST include ALL remaining column indices that contain specs (e.g., Category, Colour, Sweep, Star Rating). Do not leave this array empty if there are extra columns!
+    CRITICAL: For the "attribute_indices" array, you MUST include ALL remaining column indices that contain product specifications, features, or variants (e.g., Category, Color, Size, Capacity, Weight, Dimensions, Material, Star Rating). Do not leave this array empty if there are extra descriptive columns!
     
     Return ONLY a valid JSON object matching this schema exactly:
     {
@@ -102,9 +102,16 @@ def clean_price(val):
     try: return float(cleaned) if cleaned else 0.0
     except ValueError: return 0.0
 
-def get_deterministic_id(brand: str, model: str) -> str:
-    """Generates a consistent ID so re-uploads update existing rows instead of duplicating"""
+def get_deterministic_id(brand: str, model: str, attrs: dict = None) -> str:
+    """Generates a consistent ID including attributes to differentiate variants (e.g., colors, sizes)"""
     unique_str = f"{str(brand).strip().lower()}|{str(model).strip().lower()}"
+    
+    if attrs:
+        # Sort the dictionary items by key to ensure the hash is always identical for the exact same attributes
+        sorted_attrs = sorted(attrs.items())
+        attr_str = "|".join([f"{str(k).strip().lower()}:{str(v).strip().lower()}" for k, v in sorted_attrs])
+        unique_str += f"|{attr_str}"
+        
     return hashlib.md5(unique_str.encode()).hexdigest()
 
 # ==========================================
@@ -194,7 +201,8 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
             model_name = str(get_val("model_name_index")).strip()
             
             if ex_gst > 0 and inc_gst > 0 and model_name:
-                product_id = get_deterministic_id(clean_brand_name, model_name)
+                # Include the attributes dictionary in the ID generation so variants have distinct IDs
+                product_id = get_deterministic_id(clean_brand_name, model_name, attrs)
                 # Append row data as a list of params
                 valid_products.append([
                     product_id, clean_brand_name, model_name, mrp, 
