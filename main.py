@@ -64,7 +64,7 @@ def get_ai_schema_mapping(sample_rows):
     if not GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY environment variable is not set.")
     
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key={GEMINI_API_KEY}"
     
     # Restored to the robust prompt that worked for you originally
     system_prompt = """You are a highly adaptable data schema mapper for a general product catalog and pricing application. 
