@@ -140,7 +140,7 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
             
         all_rows = []
         
-        # 1. Extract Grid from PDF (Restored to simple extraction)
+        # 1. Extract Grid from PDF
         with pdfplumber.open(temp_pdf_path) as pdf:
             for page in pdf.pages:
                 table = page.extract_table()
@@ -175,14 +175,23 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
             print(f"Delete operation warning: {e}")
         
         valid_products = []
-        
-        # Track the last model name to handle rows that only contain variants (e.g. just a color and price)
-        last_seen_model = ""
-
         # Skip rows up to and including the AI-identified header row
         for row in all_rows[header_idx + 1:]:
             if len(row) < 3: continue
-            
+                
+            attrs = {}
+            if mapping.get("attribute_indices"):
+                for idx in mapping["attribute_indices"]:
+                    try:
+                        idx = int(idx)
+                        if idx != -1 and idx < len(row) and idx < len(headers):
+                            clean_header = ''.join(c for c in headers[idx] if c.isalnum() or c.isspace()).strip()
+                            # Prevent core fields from accidentally showing up as spec badges
+                            if clean_header and row[idx] and idx not in [mapping.get("mrp_index"), mapping.get("list_price_ex_gst_index"), mapping.get("list_price_inc_gst_index"), mapping.get("model_name_index")]:
+                                attrs[clean_header] = row[idx]
+                    except (ValueError, TypeError):
+                        continue
+                            
             def get_val(key):
                 idx = mapping.get(key, -1)
                 return row[idx] if idx != -1 and idx < len(row) else ""
@@ -191,47 +200,16 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
             inc_gst = clean_price(get_val("list_price_inc_gst_index"))
             mrp = clean_price(get_val("mrp_index"))
             model_name = str(get_val("model_name_index")).strip()
-
-            # --- CRITICAL FIX FOR MISSING ROWS ---
-            # If a row has a price but no model name, it's likely a variant (e.g., a different color)
-            # We "borrow" the model name from the row immediately above it.
-            if not model_name and (ex_gst > 0 or inc_gst > 0 or mrp > 0):
-                model_name = last_seen_model
-            elif model_name:
-                last_seen_model = model_name
-
-            # Build Attributes safely
-            attrs = {}
-            if mapping.get("attribute_indices"):
-                for idx in mapping["attribute_indices"]:
-                    try:
-                        idx = int(idx)
-                        if idx != -1 and idx < len(row) and idx < len(headers):
-                            clean_header = ''.join(c for c in headers[idx] if c.isalnum() or c.isspace()).strip()
-                            
-                            # Prevent core fields from accidentally showing up as spec badges
-                            # Make sure the cell actually has a value before adding it
-                            cell_value = str(row[idx]).strip()
-                            
-                            if clean_header and cell_value and idx not in [mapping.get("mrp_index"), mapping.get("list_price_ex_gst_index"), mapping.get("list_price_inc_gst_index"), mapping.get("model_name_index")]:
-                                attrs[clean_header] = cell_value
-                                
-                    except (ValueError, TypeError):
-                        continue
             
-            # --- VALIDATION ---
-            # As long as it has a model name and AT LEAST ONE valid price, save it.
-            if model_name and (ex_gst > 0 or inc_gst > 0 or mrp > 0):
+            # Reverted back to your exact working condition logic
+            if ex_gst > 0 and inc_gst > 0 and model_name:
                 # Include the attributes dictionary in the ID generation so variants have distinct IDs
                 product_id = get_deterministic_id(clean_brand_name, model_name, attrs)
-                
-                # Check if this exact product_id is already in the valid_products list for this batch
-                # (Prevents crashing D1 with identical IDs if a PDF row spans multiple pages weirdly)
-                if not any(p[0] == product_id for p in valid_products):
-                    valid_products.append([
-                        product_id, clean_brand_name, model_name, mrp, 
-                        ex_gst, inc_gst, json.dumps(attrs), sync_timestamp
-                    ])
+                # Append row data as a list of params
+                valid_products.append([
+                    product_id, clean_brand_name, model_name, mrp, 
+                    ex_gst, inc_gst, json.dumps(attrs), sync_timestamp
+                ])
                 
         # 4. Push to Cloudflare D1 via Multi-Row Batch Inserts
         chunk_size = 12
@@ -239,6 +217,7 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
             chunk = valid_products[i:i + chunk_size]
             
             placeholders = ",".join(["(?, ?, ?, ?, ?, ?, ?, ?)"] * len(chunk))
+            # Flatten the nested list of parameters
             params = [item for row in chunk for item in row]
             
             sql = f"""INSERT OR REPLACE INTO products 
@@ -259,7 +238,7 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
             os.unlink(temp_pdf_path)
 
 # ==========================================
-# ENDPOINT 2: DELETE BRAND (Legacy - Kept for safety)
+# ENDPOINT 2: DELETE BRAND (Used heavily by Edge logic)
 # ==========================================
 @app.delete("/api/brand/{brand_name}")
 async def delete_brand(brand_name: str):
