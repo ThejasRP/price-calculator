@@ -3,6 +3,7 @@ import time
 import json
 import uuid
 import tempfile
+import hashlib
 import requests
 import pdfplumber
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
@@ -101,6 +102,10 @@ def clean_price(val):
     try: return float(cleaned) if cleaned else 0.0
     except ValueError: return 0.0
 
+def get_deterministic_id(brand: str, model: str) -> str:
+    """Generates a consistent ID so re-uploads update existing rows instead of duplicating"""
+    unique_str = f"{str(brand).strip().lower()}|{str(model).strip().lower()}"
+    return hashlib.md5(unique_str.encode()).hexdigest()
 
 # ==========================================
 # ENDPOINT 1: UPLOAD & PROCESS PDF
@@ -153,8 +158,13 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
         # 3. Format Data
         sync_timestamp = int(time.time() * 1000) # JS compatible timestamp
         
-        # Delete old brand data in D1 before inserting new (to prevent duplicates on re-upload)
-        execute_d1_query("DELETE FROM products WHERE brand_id = ?", [brandName])
+        clean_brand_name = brandName.strip()
+
+        # Delete old brand data in D1 before inserting new (wrapped in try/except for safety)
+        try:
+            execute_d1_query("DELETE FROM products WHERE brand_id = ?", [clean_brand_name])
+        except Exception as e:
+            print(f"Delete operation warning: {e}")
         
         valid_products = []
         # Skip rows up to and including the AI-identified header row
@@ -181,12 +191,13 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
             ex_gst = clean_price(get_val("list_price_ex_gst_index"))
             inc_gst = clean_price(get_val("list_price_inc_gst_index"))
             mrp = clean_price(get_val("mrp_index"))
-            model_name = get_val("model_name_index")
+            model_name = str(get_val("model_name_index")).strip()
             
             if ex_gst > 0 and inc_gst > 0 and model_name:
+                product_id = get_deterministic_id(clean_brand_name, model_name)
                 # Append row data as a list of params
                 valid_products.append([
-                    str(uuid.uuid4()), brandName, model_name, mrp, 
+                    product_id, clean_brand_name, model_name, mrp, 
                     ex_gst, inc_gst, json.dumps(attrs), sync_timestamp
                 ])
                 
@@ -201,7 +212,7 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
             # Flatten the nested list of parameters
             params = [item for row in chunk for item in row]
             
-            sql = f"""INSERT INTO products 
+            sql = f"""INSERT OR REPLACE INTO products 
                       (id, brand_id, model_name, mrp, list_price_ex_gst, list_price_inc_gst, attributes, updated_at) 
                       VALUES {placeholders}"""
             execute_d1_query(sql, params)
