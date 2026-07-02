@@ -10,7 +10,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 
-app = FastAPI(title="RateEngine")
+app = FastAPI(title="RateEngine API (PDF -> Gemini -> Cloudflare D1)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -115,7 +115,7 @@ def get_deterministic_id(brand: str, model: str, attrs: dict = None) -> str:
     return hashlib.md5(unique_str.encode()).hexdigest()
 
 # ==========================================
-# ENDPOINT 1: UPLOAD & PROCESS PDF
+# ENDPOINT: UPLOAD & PROCESS PDF (Heavy lifting only)
 # ==========================================
 @app.post("/api/upload")
 async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
@@ -236,33 +236,3 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
     finally:
         if temp_pdf_path and os.path.exists(temp_pdf_path):
             os.unlink(temp_pdf_path)
-
-
-# ==========================================
-# ENDPOINT 2: SYNC FOR LOCAL INDEXED DB
-# ==========================================
-@app.get("/api/sync")
-async def sync_data(last_updated: int = 0, brand: Optional[str] = None):
-    """
-    Frontend Dexie calls this on app launch. 
-    It returns only the rows that have been added/modified since the app was last online.
-    """
-    try:
-        if brand:
-            # Fetch updates for a specific brand
-            sql = "SELECT * FROM products WHERE updated_at > ? AND brand_id = ?"
-            params = [last_updated, brand]
-        else:
-            # Fetch ALL updates across the entire database
-            sql = "SELECT * FROM products WHERE updated_at > ?"
-            params = [last_updated]
-            
-        rows = execute_d1_query(sql, params)
-        
-        return {
-            "status": "success",
-            "count": len(rows),
-            "data": rows
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Sync failed: {str(e)}")
