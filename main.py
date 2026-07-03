@@ -5,10 +5,19 @@ import uuid
 import tempfile
 import hashlib
 import requests
+import logging
 import pdfplumber
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
+
+# Set up basic logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger("RateEngine")
 
 app = FastAPI(title="RateEngine API (PDF -> Gemini -> Cloudflare D1)")
 
@@ -33,7 +42,7 @@ CF_API_TOKEN = os.getenv("CF_API_TOKEN", "")
 def execute_d1_query(sql: str, params: list = None):
     """Executes a query against your Cloudflare D1 Database via REST API"""
     if not all([CF_ACCOUNT_ID, CF_DATABASE_ID, CF_API_TOKEN]):
-        print("Warning: Cloudflare credentials missing. Skipping actual DB execution.")
+        logger.warning("Cloudflare credentials missing. Skipping actual DB execution.")
         return []
 
     url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/d1/database/{CF_DATABASE_ID}/query"
@@ -49,10 +58,12 @@ def execute_d1_query(sql: str, params: list = None):
     response = requests.post(url, headers=headers, json=payload)
     
     if not response.ok:
+        logger.error(f"D1 API HTTP Error: {response.text}")
         raise Exception(f"D1 API Error: {response.text}")
         
     result = response.json()
     if not result.get("success"):
+         logger.error(f"D1 Query Execution Failed: {result.get('errors')}")
          raise Exception(f"D1 Query Failed: {result.get('errors')}")
          
     return result["result"][0].get("results", [])
@@ -68,11 +79,11 @@ def get_ai_schema_mapping(sample_rows):
     
     # Restored to the robust prompt that worked for you originally
     system_prompt = """You are a highly adaptable data schema mapper for a general product catalog and pricing application. 
-    I will provide a JSON array containing the first 8 rows of an extracted PDF table representing a price list for ANY type of product including but not limited to fans, water heaters, coookers, mixers, grinders, etc.
+    I will provide a JSON array containing the first 8 rows of an extracted PDF table representing a price list for ANY type of product.
     First, identify which row actually contains the column headers (usually index 0, 1, or 2).
     Then, identify which column index (0-based) corresponds to our core database fields.
     
-    CRITICAL: For the "attribute_indices" array, you MUST include ALL remaining column indices that contain product specifications, features, or variants. For example for a fan database it could be sweep, colour, category, star rating, etc for pressure cookers it could be colour, extra features, etc. Do not leave this array empty if there are extra descriptive columns. For all columns present in the table, other than the core columns used, must be included in "attribute_indices" array!
+    CRITICAL: For the "attribute_indices" array, you MUST include ALL remaining column indices that contain product specifications, features, or variants. Do not leave this array empty if there are extra descriptive columns!
     
     Return ONLY a valid JSON object matching this schema exactly:
     {
@@ -93,9 +104,16 @@ def get_ai_schema_mapping(sample_rows):
     
     response = requests.post(url, json=payload)
     if not response.ok:
+        logger.error(f"Gemini API Error: {response.status_code} - {response.text}")
         raise Exception(f"AI Provider Error: {response.text}")
         
-    return json.loads(response.json()["candidates"][0]["content"]["parts"][0]["text"])
+    try:
+        mapping_data = json.loads(response.json()["candidates"][0]["content"]["parts"][0]["text"])
+        logger.info(f"Successfully generated AI Schema Mapping: {mapping_data}")
+        return mapping_data
+    except Exception as e:
+        logger.error(f"Failed to parse Gemini response: {e}")
+        raise
 
 def clean_price(val):
     if not val: return 0.0
@@ -128,8 +146,11 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
     5. Batch pushes to Cloudflare D1.
     """
     if not file.filename.lower().endswith('.pdf'):
+        logger.warning(f"Rejected non-PDF upload attempt: {file.filename}")
         raise HTTPException(status_code=400, detail="Must be a PDF file.")
         
+    clean_brand_name = brandName.strip()
+    logger.info(f"Starting PDF processing for brand: {clean_brand_name} (File: {file.filename})")
     temp_pdf_path = None
     try:
         # Save temp file for pdfplumber
@@ -142,6 +163,7 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
         
         # 1. Extract Grid from PDF
         with pdfplumber.open(temp_pdf_path) as pdf:
+            logger.info(f"Extracting tables from {len(pdf.pages)} pages...")
             for page in pdf.pages:
                 table = page.extract_table()
                 if table:
@@ -152,9 +174,11 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
                     all_rows.extend(cleaned_table)
                     
         if len(all_rows) < 2:
+            logger.error("Extraction failed: No readable tabular data found in PDF.")
             raise HTTPException(status_code=400, detail="No readable tabular data found in PDF.")
             
         # 2. Get AI Schema Mapping (Use first 8 rows to catch hidden headers)
+        logger.info("Requesting Schema Mapping from Gemini...")
         sample_rows = all_rows[:8]
         mapping = get_ai_schema_mapping(sample_rows)
         
@@ -170,13 +194,13 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
 
         # Delete old brand data in D1 before inserting new (wrapped in try/except for safety)
         try:
+            logger.info(f"Wiping existing D1 data for brand: {clean_brand_name}")
             execute_d1_query("DELETE FROM products WHERE brand_id = ?", [clean_brand_name])
         except Exception as e:
-            print(f"Delete operation warning: {e}")
+            logger.warning(f"Delete operation warning (Brand might be new): {e}")
         
         valid_products = []
-        # Skip rows up to and including the AI-identified header row
-        for row in all_rows[header_idx + 1:]:
+        logger.info("Parsing and cleaning rows based on AI schema...")
             if len(row) < 3: continue
                 
             attrs = {}
@@ -211,6 +235,8 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
                     ex_gst, inc_gst, json.dumps(attrs), sync_timestamp
                 ])
                 
+        logger.info(f"Found {len(valid_products)} valid products to insert.")
+        
         # 4. Push to Cloudflare D1 via Multi-Row Batch Inserts
         chunk_size = 12
         for i in range(0, len(valid_products), chunk_size):
@@ -225,12 +251,14 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
                       VALUES {placeholders}"""
             execute_d1_query(sql, params)
             
+        logger.info(f"Successfully processed and synced {len(valid_products)} products to D1 for {clean_brand_name}.")
         return {
             "status": "success", 
             "message": f"Successfully processed and synced {len(valid_products)} products to D1."
         }
         
     except Exception as e:
+        logger.error(f"Upload processing failed: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
         
     finally:
@@ -244,7 +272,10 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
 async def delete_brand(brand_name: str):
     try:
         clean_brand_name = brand_name.strip()
+        logger.info(f"Received request to delete brand: {clean_brand_name}")
         execute_d1_query("DELETE FROM products WHERE brand_id = ?", [clean_brand_name])
+        logger.info(f"Successfully deleted brand: {clean_brand_name}")
         return {"status": "success", "message": f"Deleted all data for brand: {clean_brand_name}"}
     except Exception as e:
+        logger.error(f"Failed to delete brand {brand_name}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
