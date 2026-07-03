@@ -223,11 +223,15 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
                             clean_header = ""
                             if idx < len(headers) and headers[idx]:
                                 clean_header = ''.join(c for c in str(headers[idx]) if c.isalnum() or c.isspace()).strip()
-                            if not clean_header:
-                                clean_header = f"Spec_{i+1}"
                                 
-                            if idx not in [mapping.get("mrp_index"), mapping.get("list_price_ex_gst_index"), mapping.get("list_price_inc_gst_index"), mapping.get("model_name_index")]:
-                                attrs[clean_header] = val
+                            # ONLY ADD ATTRIBUTE IF THERE IS A VALUE
+                            if val: 
+                                # If we found a clean header, use it. Otherwise, use the raw value itself as the key.
+                                # In the React frontend, we will modify it to just render the values if the key matches the value.
+                                final_key = clean_header if clean_header else val
+                                
+                                if idx not in [mapping.get("mrp_index"), mapping.get("list_price_ex_gst_index"), mapping.get("list_price_inc_gst_index"), mapping.get("model_name_index")]:
+                                    attrs[final_key] = val
                     except (ValueError, TypeError):
                         continue
                             
