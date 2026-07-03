@@ -209,28 +209,27 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
 
         for row in all_rows[header_idx + 1:]:
             # Less strict row dropping. We only care if it has at least a price column index available.
-            if len(row) == 0: continue
+        # Skip rows up to and including the AI-identified header row
+        for row in all_rows[header_idx + 1:]:
+            if len(row) < 3: continue
                 
             attrs = {}
             if mapping.get("attribute_indices"):
-                for i, idx in enumerate(mapping["attribute_indices"]):
+                for idx in mapping["attribute_indices"]:
                     try:
                         idx = int(idx)
                         if idx != -1 and idx < len(row):
                             val = str(row[idx]).strip()
-                            
-                            # Fallback logic for headers
-                            clean_header = ""
-                            if idx < len(headers) and headers[idx]:
-                                clean_header = ''.join(c for c in str(headers[idx]) if c.isalnum() or c.isspace()).strip()
+                            if val:
+                                clean_header = ""
+                                if idx < len(headers) and headers[idx]:
+                                    clean_header = ''.join(c for c in str(headers[idx]) if c.isalnum() or c.isspace()).strip()
                                 
-                            # ONLY ADD ATTRIBUTE IF THERE IS A VALUE
-                            if val: 
-                                # If we found a clean header, use it. Otherwise, use the raw value itself as the key.
-                                # In the React frontend, we will modify it to just render the values if the key matches the value.
-                                final_key = clean_header if clean_header else val
+                                # FIX: Use a stable column-based key if header is empty, 
+                                # so variants in the exact same column overwrite each other!
+                                final_key = clean_header if clean_header else f"Spec_{idx}"
                                 
-                                if idx not in [mapping.get("mrp_index"), mapping.get("list_price_ex_gst_index"), mapping.get("list_price_inc_gst_index"), mapping.get("model_name_index")]:
+                                if final_key and idx not in [mapping.get("mrp_index"), mapping.get("list_price_ex_gst_index"), mapping.get("list_price_inc_gst_index"), mapping.get("model_name_index")]:
                                     attrs[final_key] = val
                     except (ValueError, TypeError):
                         continue
@@ -247,12 +246,13 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
             current_model_name = str(get_val("model_name_index")).strip()
             
             # FORWARD FILLING LOGIC
-            # If the current row has a model name, update our "memory"
             if current_model_name:
-                last_seen_model = current_model_name
+                # FIX: If we see a brand NEW model, reset the memory!
                 model_name = current_model_name
+                last_seen_model = current_model_name
+                last_seen_attrs = {} # Wipe attributes from the previous model
             else:
-                # If blank, inherit the model name from the row above
+                # If blank, inherit the model name from the row above (Variant row)
                 model_name = last_seen_model
 
             # Merge attributes: Inherit non-blank attributes from previous rows if current is blank
