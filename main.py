@@ -4,14 +4,14 @@ import json
 import uuid
 import tempfile
 import hashlib
-import requests
 import logging
+import requests
 import pdfplumber
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 
-# Set up basic logging
+# Set up basic logging for Render console
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -58,12 +58,12 @@ def execute_d1_query(sql: str, params: list = None):
     response = requests.post(url, headers=headers, json=payload)
     
     if not response.ok:
-        logger.error(f"D1 API HTTP Error: {response.text}")
+        logger.error(f"D1 API Error: {response.text}")
         raise Exception(f"D1 API Error: {response.text}")
         
     result = response.json()
     if not result.get("success"):
-         logger.error(f"D1 Query Execution Failed: {result.get('errors')}")
+         logger.error(f"D1 Query Failed: {result.get('errors')}")
          raise Exception(f"D1 Query Failed: {result.get('errors')}")
          
     return result["result"][0].get("results", [])
@@ -75,15 +75,15 @@ def get_ai_schema_mapping(sample_rows):
     if not GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY environment variable is not set.")
     
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    # Using 3.5-flash as requested
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key={GEMINI_API_KEY}"
     
-    # Restored to the robust prompt that worked for you originally
     system_prompt = """You are a highly adaptable data schema mapper for a general product catalog and pricing application. 
     I will provide a JSON array containing the first 8 rows of an extracted PDF table representing a price list for ANY type of product.
     First, identify which row actually contains the column headers (usually index 0, 1, or 2).
     Then, identify which column index (0-based) corresponds to our core database fields.
     
-    CRITICAL: For the "attribute_indices" array, you MUST include ALL remaining column indices. Do not leave this array empty as there are extra descriptive columns that are critical for the user!
+    CRITICAL: For the "attribute_indices" array, you MUST include ALL remaining column indices that contain product specifications, features, or variants. Do not leave this array empty if there are extra descriptive columns!
     
     Return ONLY a valid JSON object matching this schema exactly:
     {
@@ -104,16 +104,10 @@ def get_ai_schema_mapping(sample_rows):
     
     response = requests.post(url, json=payload)
     if not response.ok:
-        logger.error(f"Gemini API Error: {response.status_code} - {response.text}")
+        logger.error(f"AI Provider Error: {response.text}")
         raise Exception(f"AI Provider Error: {response.text}")
         
-    try:
-        mapping_data = json.loads(response.json()["candidates"][0]["content"]["parts"][0]["text"])
-        logger.info(f"Successfully generated AI Schema Mapping: {mapping_data}")
-        return mapping_data
-    except Exception as e:
-        logger.error(f"Failed to parse Gemini response: {e}")
-        raise
+    return json.loads(response.json()["candidates"][0]["content"]["parts"][0]["text"])
 
 def clean_price(val):
     if not val: return 0.0
@@ -146,7 +140,6 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
     5. Batch pushes to Cloudflare D1.
     """
     if not file.filename.lower().endswith('.pdf'):
-        logger.warning(f"Rejected non-PDF upload attempt: {file.filename}")
         raise HTTPException(status_code=400, detail="Must be a PDF file.")
         
     clean_brand_name = brandName.strip()
@@ -165,7 +158,6 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
         with pdfplumber.open(temp_pdf_path) as pdf:
             logger.info(f"Extracting tables from {len(pdf.pages)} pages...")
             for page in pdf.pages:
-                # Use default settings which proved highly successful in local testing
                 table = page.extract_table()
                 if table:
                     cleaned_table = [
@@ -175,13 +167,14 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
                     all_rows.extend(cleaned_table)
                     
         if len(all_rows) < 2:
-            logger.error("Extraction failed: No readable tabular data found in PDF.")
+            logger.error("No readable tabular data found in PDF.")
             raise HTTPException(status_code=400, detail="No readable tabular data found in PDF.")
             
         # 2. Get AI Schema Mapping (Use first 8 rows to catch hidden headers)
         logger.info("Requesting Schema Mapping from Gemini...")
         sample_rows = all_rows[:8]
         mapping = get_ai_schema_mapping(sample_rows)
+        logger.info(f"Successfully generated AI Schema Mapping: {mapping}")
         
         header_idx = mapping.get("header_row_index", 0)
         if header_idx >= len(all_rows): 
@@ -190,26 +183,21 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
         
         # 3. Format Data
         sync_timestamp = int(time.time() * 1000) # JS compatible timestamp
-        
-        clean_brand_name = brandName.strip()
 
         # Delete old brand data in D1 before inserting new (wrapped in try/except for safety)
         try:
             logger.info(f"Wiping existing D1 data for brand: {clean_brand_name}")
             execute_d1_query("DELETE FROM products WHERE brand_id = ?", [clean_brand_name])
         except Exception as e:
-            logger.warning(f"Delete operation warning (Brand might be new): {e}")
+            logger.warning(f"Delete operation warning: {e}")
         
         valid_products = []
-        logger.info("Parsing and cleaning rows based on AI schema...")
         
         # State variables for forward-filling
         last_seen_model = ""
         last_seen_attrs = {}
 
-        for row in all_rows[header_idx + 1:]:
-            # Less strict row dropping. We only care if it has at least a price column index available.
-        # Skip rows up to and including the AI-identified header row
+        logger.info("Parsing and cleaning rows based on AI schema...")
         for row in all_rows[header_idx + 1:]:
             if len(row) < 3: continue
                 
@@ -221,15 +209,14 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
                         if idx != -1 and idx < len(row):
                             val = str(row[idx]).strip()
                             if val:
+                                # We use a consistent fallback key if the header is empty.
                                 clean_header = ""
                                 if idx < len(headers) and headers[idx]:
                                     clean_header = ''.join(c for c in str(headers[idx]) if c.isalnum() or c.isspace()).strip()
                                 
-                                # FIX: Use a stable column-based key if header is empty, 
-                                # so variants in the exact same column overwrite each other!
                                 final_key = clean_header if clean_header else f"Spec_{idx}"
                                 
-                                if final_key and idx not in [mapping.get("mrp_index"), mapping.get("list_price_ex_gst_index"), mapping.get("list_price_inc_gst_index"), mapping.get("model_name_index")]:
+                                if idx not in [mapping.get("mrp_index"), mapping.get("list_price_ex_gst_index"), mapping.get("list_price_inc_gst_index"), mapping.get("model_name_index")]:
                                     attrs[final_key] = val
                     except (ValueError, TypeError):
                         continue
@@ -242,35 +229,28 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
             inc_gst = clean_price(get_val("list_price_inc_gst_index"))
             mrp = clean_price(get_val("mrp_index"))
             
-            # Look at current row for model name
             current_model_name = str(get_val("model_name_index")).strip()
             
-            # FORWARD FILLING LOGIC
+            # Forward Filling Logic
             if current_model_name:
-                # FIX: If we see a brand NEW model, reset the memory!
                 model_name = current_model_name
                 last_seen_model = current_model_name
-                last_seen_attrs = {} # Wipe attributes from the previous model
+                last_seen_attrs = {} # CRITICAL FIX: Wipe memory when a new model starts
             else:
-                # If blank, inherit the model name from the row above (Variant row)
                 model_name = last_seen_model
 
-            # Merge attributes: Inherit non-blank attributes from previous rows if current is blank
+            # Merge attributes intelligently
             merged_attrs = {}
-            # Start with the last known attributes
             for k, v in last_seen_attrs.items():
                  merged_attrs[k] = v
-            # Override with any NEW attributes found on this specific row
             for k, v in attrs.items():
-                if v: # Only override if the new row actually has a value for this spec
+                if v: 
                     merged_attrs[k] = v
             
-            # Update memory for the next loop iteration
             last_seen_attrs = merged_attrs.copy()
 
-            # Validation: We ONLY save if we found a valid price, AND we have a model name (either explicit or inherited)
+            # We ONLY save if we found a valid price, AND we have a model name
             if (ex_gst > 0 or inc_gst > 0 or mrp > 0) and model_name:
-                
                 # Filter out completely empty spec badges before saving
                 final_attrs = {k: v for k, v in merged_attrs.items() if str(v).strip() != ""}
 
