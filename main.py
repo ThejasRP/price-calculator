@@ -68,11 +68,11 @@ def get_ai_schema_mapping(sample_rows):
     
     # Restored to the robust prompt that worked for you originally
     system_prompt = """You are a highly adaptable data schema mapper for a general product catalog and pricing application. 
-    I will provide a JSON array containing the first 8 rows of an extracted PDF table representing a price list for ANY type of product.
+    I will provide a JSON array containing the first 8 rows of an extracted PDF table representing a price list for ANY type of product including but not limited to fans, water heaters, coookers, mixers, grinders, etc.
     First, identify which row actually contains the column headers (usually index 0, 1, or 2).
     Then, identify which column index (0-based) corresponds to our core database fields.
     
-    CRITICAL: For the "attribute_indices" array, you MUST include ALL remaining column indices that contain product specifications, features, or variants. Do not leave this array empty if there are extra descriptive columns!
+    CRITICAL: For the "attribute_indices" array, you MUST include ALL remaining column indices that contain product specifications, features, or variants. For example for a fan database it could be sweep, colour, category, star rating, etc for pressure cookers it could be colour, extra features, etc. Do not leave this array empty if there are extra descriptive columns. For all columns present in the table, other than the core columns used, must be included in "attribute_indices" array!
     
     Return ONLY a valid JSON object matching this schema exactly:
     {
