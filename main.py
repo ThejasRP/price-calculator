@@ -165,13 +165,8 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
         with pdfplumber.open(temp_pdf_path) as pdf:
             logger.info(f"Extracting tables from {len(pdf.pages)} pages...")
             for page in pdf.pages:
-                # Use strict table settings to prevent cell merging/drifting issues
-                table = page.extract_table(table_settings={
-                    "vertical_strategy": "text", 
-                    "horizontal_strategy": "text",
-                    "intersection_y_tolerance": 5,
-                    "intersection_x_tolerance": 5
-                })
+                # Use default settings which proved highly successful in local testing
+                table = page.extract_table()
                 if table:
                     cleaned_table = [
                         [str(cell).replace('\n', ' ').strip() if cell else "" for cell in row]
