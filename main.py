@@ -23,7 +23,7 @@ app = FastAPI(title="RateEngine API (PDF -> Gemini -> Cloudflare D1)")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://unity-pricecheck.pages.dev"], 
+    allow_origins=["*"], # Restrict this to your frontend URL in production
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -77,7 +77,6 @@ def get_ai_schema_mapping(sample_rows):
     
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key={GEMINI_API_KEY}"
     
-    # NEW: Smarter prompt asking AI to separate Global (Categories) from Variants (Colors/Sizes)
     system_prompt = """You are a highly adaptable data schema mapper for a general product catalog and pricing application. 
     I will provide a JSON array containing the first 8 rows of an extracted PDF table representing a price list for ANY type of product.
     First, identify which row actually contains the column headers (usually index 0, 1, or 2).
@@ -107,11 +106,29 @@ def get_ai_schema_mapping(sample_rows):
         "generationConfig": {"responseMimeType": "application/json"}
     }
     
-    response = requests.post(url, json=payload)
-    if not response.ok:
-        raise Exception(f"AI Provider Error: {response.text}")
+    try:
+        response = requests.post(url, json=payload)
+        response.raise_for_status() # Raises exception for 4xx or 5xx status codes
         
-    return json.loads(response.json()["candidates"][0]["content"]["parts"][0]["text"])
+        raw_text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
+        
+        # ERROR HANDLING: Strip markdown code blocks if the AI stubbornly adds them
+        clean_text = raw_text.strip()
+        if clean_text.startswith("```json"):
+            clean_text = clean_text[7:]
+        elif clean_text.startswith("```"):
+            clean_text = clean_text[3:]
+        if clean_text.endswith("```"):
+            clean_text = clean_text[:-3]
+            
+        return json.loads(clean_text.strip())
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Network error communicating with Gemini API: {e}")
+        raise ValueError("Failed to connect to AI mapping service.")
+    except (KeyError, IndexError, json.JSONDecodeError) as e:
+        logger.error(f"Failed to parse Gemini response: {e}. Raw response: {response.text if 'response' in locals() else 'None'}")
+        raise ValueError("AI returned an invalid schema format. Please try again.")
 
 def clean_price(val):
     if not val: return 0.0
@@ -159,20 +176,24 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
         all_rows = []
         
         # 1. Extract Grid from PDF
-        with pdfplumber.open(temp_pdf_path) as pdf:
-            logger.info(f"Extracting tables from {len(pdf.pages)} pages...")
-            for page in pdf.pages:
-                table = page.extract_table()
-                if table:
-                    cleaned_table = [
-                        [str(cell).replace('\n', ' ').strip() if cell else "" for cell in row]
-                        for row in table if any(cell for cell in row)
-                    ]
-                    all_rows.extend(cleaned_table)
+        try:
+            with pdfplumber.open(temp_pdf_path) as pdf:
+                logger.info(f"Extracting tables from {len(pdf.pages)} pages...")
+                for page in pdf.pages:
+                    table = page.extract_table()
+                    if table:
+                        cleaned_table = [
+                            [str(cell).replace('\n', ' ').strip() if cell else "" for cell in row]
+                            for row in table if any(cell for cell in row)
+                        ]
+                        all_rows.extend(cleaned_table)
+        except Exception as e:
+            logger.error(f"PDF Parsing Failed: {e}")
+            raise HTTPException(status_code=400, detail="Could not read PDF. The file might be corrupted, encrypted, or not text-based.")
                     
         if len(all_rows) < 2:
             logger.error("No readable tabular data found in PDF.")
-            raise HTTPException(status_code=400, detail="No readable tabular data found in PDF.")
+            raise HTTPException(status_code=400, detail="No readable tabular data found in PDF. Make sure it is a standard table format.")
             
         # 2. Get AI Schema Mapping (Use first 8 rows to catch hidden headers)
         logger.info("Requesting Schema Mapping from Gemini...")
@@ -187,10 +208,13 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
         # SMART HEADER EXTRACTION: Scan vertically to catch multi-line headers (e.g. "Sweep" on row 1, "(mm)" on row 2)
         def get_clean_header(col_idx):
             parts = []
-            for r in range(header_idx + 1):
+            # Limit scan to max 3 rows above header to avoid catching document titles at the very top of the page
+            start_row = max(0, header_idx - 2)
+            for r in range(start_row, header_idx + 1):
                 if r < len(all_rows) and col_idx < len(all_rows[r]):
                     val = str(all_rows[r][col_idx]).strip()
-                    if val:
+                    # Ignore massive text blocks (usually catalog titles spilling into the first column)
+                    if val and len(val) < 35:
                         parts.append(val)
             raw_header = " ".join(parts)
             return ''.join(c for c in raw_header if c.isalnum() or c.isspace()).strip()
