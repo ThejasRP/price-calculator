@@ -201,6 +201,9 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
         
         valid_products = []
         logger.info("Parsing and cleaning rows based on AI schema...")
+        
+        # WE NEED THIS FOR LOOP HERE
+        for row in all_rows[header_idx + 1:]:
             if len(row) < 3: continue
                 
             attrs = {}
