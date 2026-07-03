@@ -165,7 +165,13 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
         with pdfplumber.open(temp_pdf_path) as pdf:
             logger.info(f"Extracting tables from {len(pdf.pages)} pages...")
             for page in pdf.pages:
-                table = page.extract_table()
+                # Use strict table settings to prevent cell merging/drifting issues
+                table = page.extract_table(table_settings={
+                    "vertical_strategy": "text", 
+                    "horizontal_strategy": "text",
+                    "intersection_y_tolerance": 5,
+                    "intersection_x_tolerance": 5
+                })
                 if table:
                     cleaned_table = [
                         [str(cell).replace('\n', ' ').strip() if cell else "" for cell in row]
@@ -202,20 +208,31 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
         valid_products = []
         logger.info("Parsing and cleaning rows based on AI schema...")
         
-        # WE NEED THIS FOR LOOP HERE
+        # State variables for forward-filling
+        last_seen_model = ""
+        last_seen_attrs = {}
+
         for row in all_rows[header_idx + 1:]:
-            if len(row) < 3: continue
+            # Less strict row dropping. We only care if it has at least a price column index available.
+            if len(row) == 0: continue
                 
             attrs = {}
             if mapping.get("attribute_indices"):
-                for idx in mapping["attribute_indices"]:
+                for i, idx in enumerate(mapping["attribute_indices"]):
                     try:
                         idx = int(idx)
-                        if idx != -1 and idx < len(row) and idx < len(headers):
-                            clean_header = ''.join(c for c in headers[idx] if c.isalnum() or c.isspace()).strip()
-                            # Prevent core fields from accidentally showing up as spec badges
-                            if clean_header and row[idx] and idx not in [mapping.get("mrp_index"), mapping.get("list_price_ex_gst_index"), mapping.get("list_price_inc_gst_index"), mapping.get("model_name_index")]:
-                                attrs[clean_header] = row[idx]
+                        if idx != -1 and idx < len(row):
+                            val = str(row[idx]).strip()
+                            
+                            # Fallback logic for headers
+                            clean_header = ""
+                            if idx < len(headers) and headers[idx]:
+                                clean_header = ''.join(c for c in str(headers[idx]) if c.isalnum() or c.isspace()).strip()
+                            if not clean_header:
+                                clean_header = f"Spec_{i+1}"
+                                
+                            if idx not in [mapping.get("mrp_index"), mapping.get("list_price_ex_gst_index"), mapping.get("list_price_inc_gst_index"), mapping.get("model_name_index")]:
+                                attrs[clean_header] = val
                     except (ValueError, TypeError):
                         continue
                             
@@ -226,17 +243,46 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
             ex_gst = clean_price(get_val("list_price_ex_gst_index"))
             inc_gst = clean_price(get_val("list_price_inc_gst_index"))
             mrp = clean_price(get_val("mrp_index"))
-            model_name = str(get_val("model_name_index")).strip()
             
-            # Reverted back to your exact working condition logic
-            if ex_gst > 0 and inc_gst > 0 and model_name:
-                # Include the attributes dictionary in the ID generation so variants have distinct IDs
-                product_id = get_deterministic_id(clean_brand_name, model_name, attrs)
-                # Append row data as a list of params
-                valid_products.append([
-                    product_id, clean_brand_name, model_name, mrp, 
-                    ex_gst, inc_gst, json.dumps(attrs), sync_timestamp
-                ])
+            # Look at current row for model name
+            current_model_name = str(get_val("model_name_index")).strip()
+            
+            # FORWARD FILLING LOGIC
+            # If the current row has a model name, update our "memory"
+            if current_model_name:
+                last_seen_model = current_model_name
+                model_name = current_model_name
+            else:
+                # If blank, inherit the model name from the row above
+                model_name = last_seen_model
+
+            # Merge attributes: Inherit non-blank attributes from previous rows if current is blank
+            merged_attrs = {}
+            # Start with the last known attributes
+            for k, v in last_seen_attrs.items():
+                 merged_attrs[k] = v
+            # Override with any NEW attributes found on this specific row
+            for k, v in attrs.items():
+                if v: # Only override if the new row actually has a value for this spec
+                    merged_attrs[k] = v
+            
+            # Update memory for the next loop iteration
+            last_seen_attrs = merged_attrs.copy()
+
+            # Validation: We ONLY save if we found a valid price, AND we have a model name (either explicit or inherited)
+            if (ex_gst > 0 or inc_gst > 0 or mrp > 0) and model_name:
+                
+                # Filter out completely empty spec badges before saving
+                final_attrs = {k: v for k, v in merged_attrs.items() if str(v).strip() != ""}
+
+                product_id = get_deterministic_id(clean_brand_name, model_name, final_attrs)
+                
+                # Prevent inserting duplicate IDs in the same batch
+                if not any(p[0] == product_id for p in valid_products):
+                    valid_products.append([
+                        product_id, clean_brand_name, model_name, mrp, 
+                        ex_gst, inc_gst, json.dumps(final_attrs), sync_timestamp
+                    ])
                 
         logger.info(f"Found {len(valid_products)} valid products to insert.")
         
