@@ -23,7 +23,7 @@ app = FastAPI(title="RateEngine API (PDF -> Gemini -> Cloudflare D1)")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Restrict this to your frontend URL in production
+    allow_origins=["https://unity-pricecheck.pages.dev"], 
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -183,8 +183,18 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
         header_idx = mapping.get("header_row_index", 0)
         if header_idx >= len(all_rows): 
             header_idx = 0
-        headers = all_rows[header_idx]
-        
+            
+        # SMART HEADER EXTRACTION: Scan vertically to catch multi-line headers (e.g. "Sweep" on row 1, "(mm)" on row 2)
+        def get_clean_header(col_idx):
+            parts = []
+            for r in range(header_idx + 1):
+                if r < len(all_rows) and col_idx < len(all_rows[r]):
+                    val = str(all_rows[r][col_idx]).strip()
+                    if val:
+                        parts.append(val)
+            raw_header = " ".join(parts)
+            return ''.join(c for c in raw_header if c.isalnum() or c.isspace()).strip()
+
         # Fallback handling in case AI uses the old schema format
         global_indices = mapping.get("global_attribute_indices", [])
         variant_indices = mapping.get("variant_attribute_indices", [])
@@ -233,8 +243,8 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
             for idx in global_indices:
                 try:
                     idx = int(idx)
-                    if idx != -1 and idx < len(row) and idx < len(headers):
-                        clean_header = ''.join(c for c in headers[idx] if c.isalnum() or c.isspace()).strip()
+                    if idx != -1 and idx < len(row):
+                        clean_header = get_clean_header(idx)
                         val = str(row[idx]).strip()
                         if val and clean_header:
                             global_memory[clean_header] = val
@@ -247,8 +257,8 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
             for idx in variant_indices:
                 try:
                     idx = int(idx)
-                    if idx != -1 and idx < len(row) and idx < len(headers):
-                        clean_header = ''.join(c for c in headers[idx] if c.isalnum() or c.isspace()).strip()
+                    if idx != -1 and idx < len(row):
+                        clean_header = get_clean_header(idx)
                         # Prevent core fields from accidentally showing up as specs
                         if idx not in [mapping.get("mrp_index"), mapping.get("list_price_ex_gst_index"), mapping.get("list_price_inc_gst_index"), mapping.get("model_name_index")]:
                             val = str(row[idx]).strip()
