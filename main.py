@@ -75,15 +75,19 @@ def get_ai_schema_mapping(sample_rows):
     if not GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY environment variable is not set.")
     
-    # Using 3.5-flash as requested
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key={GEMINI_API_KEY}"
     
+    # NEW: Smarter prompt asking AI to separate Global (Categories) from Variants (Colors/Sizes)
     system_prompt = """You are a highly adaptable data schema mapper for a general product catalog and pricing application. 
     I will provide a JSON array containing the first 8 rows of an extracted PDF table representing a price list for ANY type of product.
     First, identify which row actually contains the column headers (usually index 0, 1, or 2).
     Then, identify which column index (0-based) corresponds to our core database fields.
     
-    CRITICAL: For the "attribute_indices" array, you MUST include ALL remaining column indices that contain product specifications, features, or variants. Do not leave this array empty if there are extra descriptive columns!
+    CRITICAL INSTRUCTIONS FOR ATTRIBUTES:
+    You must sort all remaining descriptive columns into TWO arrays:
+    1. "global_attribute_indices": Columns that group multiple models together (e.g., Category, Series, Product Type). These persist across many items.
+    2. "variant_attribute_indices": Columns that define specific variations of a single model (e.g., Color, Size, Sweep, RPM, Watts).
+    Do not leave these empty if descriptive columns exist!
     
     Return ONLY a valid JSON object matching this schema exactly:
     {
@@ -92,7 +96,8 @@ def get_ai_schema_mapping(sample_rows):
       "mrp_index": integer,
       "list_price_ex_gst_index": integer, 
       "list_price_inc_gst_index": integer,
-      "attribute_indices": [integer, integer, ...]
+      "global_attribute_indices": [integer, integer, ...],
+      "variant_attribute_indices": [integer, integer, ...]
     }
     Use -1 if a core field is completely missing."""
     
@@ -104,7 +109,6 @@ def get_ai_schema_mapping(sample_rows):
     
     response = requests.post(url, json=payload)
     if not response.ok:
-        logger.error(f"AI Provider Error: {response.text}")
         raise Exception(f"AI Provider Error: {response.text}")
         
     return json.loads(response.json()["candidates"][0]["content"]["parts"][0]["text"])
@@ -181,79 +185,89 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
             header_idx = 0
         headers = all_rows[header_idx]
         
+        # Fallback handling in case AI uses the old schema format
+        global_indices = mapping.get("global_attribute_indices", [])
+        variant_indices = mapping.get("variant_attribute_indices", [])
+        if not global_indices and not variant_indices and mapping.get("attribute_indices"):
+            variant_indices = mapping.get("attribute_indices")
+        
         # 3. Format Data
         sync_timestamp = int(time.time() * 1000) # JS compatible timestamp
+        
+        clean_brand_name = brandName.strip()
 
-        # Delete old brand data in D1 before inserting new (wrapped in try/except for safety)
+        # Delete old brand data in D1 before inserting new
         try:
-            logger.info(f"Wiping existing D1 data for brand: {clean_brand_name}")
             execute_d1_query("DELETE FROM products WHERE brand_id = ?", [clean_brand_name])
         except Exception as e:
-            logger.warning(f"Delete operation warning: {e}")
+            print(f"Delete operation warning: {e}")
         
         valid_products = []
         
-        # State variables for forward-filling
+        # --- THE NEW DUAL-MEMORY ARCHITECTURE ---
         last_seen_model = ""
-        last_seen_attrs = {}
-
-        logger.info("Parsing and cleaning rows based on AI schema...")
+        global_memory = {}  # Persists forever (Category ghosting)
+        variant_memory = {} # Wiped on every new model
+        
+        # Skip rows up to and including the AI-identified header row
         for row in all_rows[header_idx + 1:]:
             if len(row) < 3: continue
-                
-            attrs = {}
-            if mapping.get("attribute_indices"):
-                for idx in mapping["attribute_indices"]:
-                    try:
-                        idx = int(idx)
-                        if idx != -1 and idx < len(row):
-                            val = str(row[idx]).strip()
-                            if val:
-                                # We use a consistent fallback key if the header is empty.
-                                clean_header = ""
-                                if idx < len(headers) and headers[idx]:
-                                    clean_header = ''.join(c for c in str(headers[idx]) if c.isalnum() or c.isspace()).strip()
-                                
-                                final_key = clean_header if clean_header else f"Spec_{idx}"
-                                
-                                if idx not in [mapping.get("mrp_index"), mapping.get("list_price_ex_gst_index"), mapping.get("list_price_inc_gst_index"), mapping.get("model_name_index")]:
-                                    attrs[final_key] = val
-                    except (ValueError, TypeError):
-                        continue
-                            
+            
+            # 1. Identify if this is a NEW model or a Sub-Variant
             def get_val(key):
                 idx = mapping.get(key, -1)
                 return row[idx] if idx != -1 and idx < len(row) else ""
+                
+            current_model_val = str(get_val("model_name_index")).strip()
+            
+            if current_model_val:
+                # NEW MODEL DETECTED: Update memory and WIPE the old variants
+                model_name = current_model_val
+                last_seen_model = current_model_val
+                variant_memory = {} 
+            else:
+                # BLANK MODEL DETECTED: Inherit the model name
+                model_name = last_seen_model
+
+            # 2. Extract and Update Global Memory (Categories, Series)
+            for idx in global_indices:
+                try:
+                    idx = int(idx)
+                    if idx != -1 and idx < len(row) and idx < len(headers):
+                        clean_header = ''.join(c for c in headers[idx] if c.isalnum() or c.isspace()).strip()
+                        val = str(row[idx]).strip()
+                        if val and clean_header:
+                            global_memory[clean_header] = val
+                        elif val and not clean_header:
+                            global_memory[f"Spec_{idx}"] = val
+                except (ValueError, TypeError):
+                    continue
+                    
+            # 3. Extract and Update Variant Memory (Colors, Sizes)
+            for idx in variant_indices:
+                try:
+                    idx = int(idx)
+                    if idx != -1 and idx < len(row) and idx < len(headers):
+                        clean_header = ''.join(c for c in headers[idx] if c.isalnum() or c.isspace()).strip()
+                        # Prevent core fields from accidentally showing up as specs
+                        if idx not in [mapping.get("mrp_index"), mapping.get("list_price_ex_gst_index"), mapping.get("list_price_inc_gst_index"), mapping.get("model_name_index")]:
+                            val = str(row[idx]).strip()
+                            if val and clean_header:
+                                variant_memory[clean_header] = val
+                            elif val and not clean_header:
+                                variant_memory[f"Spec_{idx}"] = val
+                except (ValueError, TypeError):
+                    continue
+
+            # 4. Merge memories for the final product row
+            final_attrs = {**global_memory, **variant_memory}
 
             ex_gst = clean_price(get_val("list_price_ex_gst_index"))
             inc_gst = clean_price(get_val("list_price_inc_gst_index"))
             mrp = clean_price(get_val("mrp_index"))
             
-            current_model_name = str(get_val("model_name_index")).strip()
-            
-            # Forward Filling Logic
-            if current_model_name:
-                model_name = current_model_name
-                last_seen_model = current_model_name
-                last_seen_attrs = {} # CRITICAL FIX: Wipe memory when a new model starts
-            else:
-                model_name = last_seen_model
-
-            # Merge attributes intelligently
-            merged_attrs = {}
-            for k, v in last_seen_attrs.items():
-                 merged_attrs[k] = v
-            for k, v in attrs.items():
-                if v: 
-                    merged_attrs[k] = v
-            
-            last_seen_attrs = merged_attrs.copy()
-
-            # We ONLY save if we found a valid price, AND we have a model name
-            if (ex_gst > 0 or inc_gst > 0 or mrp > 0) and model_name:
-                # Filter out completely empty spec badges before saving
-                final_attrs = {k: v for k, v in merged_attrs.items() if str(v).strip() != ""}
-
+            # 5. Save the row if it contains pricing
+            if ex_gst > 0 and inc_gst > 0 and model_name:
                 product_id = get_deterministic_id(clean_brand_name, model_name, final_attrs)
                 
                 # Prevent inserting duplicate IDs in the same batch
@@ -263,8 +277,6 @@ async def upload_pdf(brandName: str = Form(...), file: UploadFile = File(...)):
                         ex_gst, inc_gst, json.dumps(final_attrs), sync_timestamp
                     ])
                 
-        logger.info(f"Found {len(valid_products)} valid products to insert.")
-        
         # 4. Push to Cloudflare D1 via Multi-Row Batch Inserts
         chunk_size = 12
         for i in range(0, len(valid_products), chunk_size):
